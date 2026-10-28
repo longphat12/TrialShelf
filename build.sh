@@ -9,7 +9,7 @@ APP="$BUILD_DIR/TrialShelf.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$DIST_DIR"
 cp "$ROOT/Info.plist" "$APP/Contents/Info.plist"
-iconutil -c icns "$ROOT/Resources/TrialShelf.iconset" -o "$APP/Contents/Resources/AppIcon.icns"
+cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 
 swiftc \
   -parse-as-library \

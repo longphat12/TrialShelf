@@ -70,6 +70,13 @@ final class FileCatalog: ObservableObject {
         return id
     }
 
+    func hasPackage(named name: String, parentID: UUID?) -> Bool {
+        let component = packageComponent(name)
+        return packages.contains {
+            $0.parentID == parentID && packageComponent($0.name).localizedCaseInsensitiveCompare(component) == .orderedSame
+        }
+    }
+
     func add(urls: [URL], to packageID: UUID, shellScriptExpiryDays: Int? = nil) -> Int {
         var existingPaths = Set(files.filter { $0.packageID == packageID }.compactMap(\.sourcePath))
         var additions: [TrackedFile] = []
@@ -77,7 +84,8 @@ final class FileCatalog: ObservableObject {
         for url in urls {
             let sourcePath = url.standardizedFileURL.path
             guard !existingPaths.contains(sourcePath),
-                  let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .contentModificationDateKey]),
+                  let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .contentModificationDateKey]),
+                  values.isSymbolicLink != true,
                   values.isRegularFile == true else { continue }
 
             let id = UUID()
@@ -106,6 +114,7 @@ final class FileCatalog: ObservableObject {
     }
 
     func addFolder(_ folder: URL, to packageID: UUID, shellScriptExpiryDays: Int?) -> Int {
+        guard (try? folder.resourceValues(forKeys: [.isSymbolicLinkKey]))?.isSymbolicLink != true else { return 0 }
         guard let enumerator = FileManager.default.enumerator(
             at: folder,
             includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey, .contentModificationDateKey],
@@ -114,7 +123,12 @@ final class FileCatalog: ObservableObject {
 
         var urls: [URL] = []
         while let url = enumerator.nextObject() as? URL {
-            if (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true {
+            guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey]) else { continue }
+            if values.isSymbolicLink == true {
+                enumerator.skipDescendants()
+                continue
+            }
+            if values.isRegularFile == true {
                 urls.append(url)
             }
         }
@@ -125,6 +139,7 @@ final class FileCatalog: ObservableObject {
     }
 
     func shellScriptCount(in folder: URL) -> Int {
+        guard (try? folder.resourceValues(forKeys: [.isSymbolicLinkKey]))?.isSymbolicLink != true else { return 0 }
         guard let enumerator = FileManager.default.enumerator(
             at: folder,
             includingPropertiesForKeys: [.isRegularFileKey],
@@ -132,8 +147,12 @@ final class FileCatalog: ObservableObject {
         ) else { return 0 }
         var count = 0
         while let url = enumerator.nextObject() as? URL {
-            if url.pathExtension.lowercased() == "sh",
-               (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true {
+            guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey]) else { continue }
+            if values.isSymbolicLink == true {
+                enumerator.skipDescendants()
+                continue
+            }
+            if url.pathExtension.lowercased() == "sh", values.isRegularFile == true {
                 count += 1
             }
         }
@@ -144,13 +163,12 @@ final class FileCatalog: ObservableObject {
         guard let package = packages.first(where: { $0.id == id }) else {
             return filesDirectory.appendingPathComponent(id.uuidString, isDirectory: true)
         }
-        let name = package.name
-        let safeName = name.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
+        let component = packageComponent(package.name)
         if let parentID = package.parentID {
-            return packageDirectory(parentID).appendingPathComponent(safeName, isDirectory: true)
+            return packageDirectory(parentID).appendingPathComponent(component, isDirectory: true)
         }
         return filesDirectory.appendingPathComponent(id.uuidString, isDirectory: true)
-            .appendingPathComponent(safeName, isDirectory: true)
+            .appendingPathComponent(component, isDirectory: true)
     }
 
     func files(in packageID: UUID) -> [TrackedFile] {
@@ -163,7 +181,7 @@ final class FileCatalog: ObservableObject {
     }
 
     func removePackage(_ packageID: UUID) {
-        guard let package = packages.first(where: { $0.id == packageID }) else { return }
+        guard packages.contains(where: { $0.id == packageID }) else { return }
         var removedIDs: Set<UUID> = [packageID]
         var pending = [packageID]
         while let current = pending.popLast() {
@@ -172,10 +190,14 @@ final class FileCatalog: ObservableObject {
                 pending.append(childID)
             }
         }
-        let folderToRemove = package.parentID == nil
-            ? filesDirectory.appendingPathComponent(package.id.uuidString, isDirectory: true)
-            : packageDirectory(packageID)
-        try? FileManager.default.removeItem(at: folderToRemove)
+        // Remove only copies recorded for this package tree. Folder names are
+        // display labels and must never decide which on-disk data gets deleted.
+        let removedFiles = files.filter { $0.packageID.map(removedIDs.contains) == true }
+        for file in removedFiles where isManaged(file.url) {
+            try? FileManager.default.removeItem(at: file.url)
+            removeEmptyManagedParents(of: file.url.deletingLastPathComponent())
+        }
+        for id in removedIDs { removeEmptyManagedParents(of: packageDirectory(id)) }
         files.removeAll { $0.packageID.map(removedIDs.contains) == true }
         packages.removeAll { removedIDs.contains($0.id) }
         save()
@@ -214,26 +236,61 @@ final class FileCatalog: ObservableObject {
         files = decoded
         loadPackages()
         var migrated = false
+        let linkedFiles = files.filter {
+            (try? $0.url.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true
+        }
+        if !linkedFiles.isEmpty {
+            for file in linkedFiles where isManaged(file.url) {
+                try? FileManager.default.removeItem(at: file.url)
+            }
+            let linkedIDs = Set(linkedFiles.map(\.id))
+            files.removeAll { linkedIDs.contains($0.id) }
+            migrated = true
+        }
         if packages.isEmpty && !files.isEmpty {
             let legacyID = createPackage(name: "Gói cũ")
             for index in files.indices { files[index].packageID = legacyID }
             migrated = true
         }
+        var migratedManagedFiles: [URL] = []
         for index in files.indices {
             guard let packageID = files[index].packageID,
-                  !files[index].url.standardizedFileURL.path.hasPrefix(packageDirectory(packageID).path + "/"),
+                  !files[index].url.standardizedFileURL.path.hasPrefix(packageDirectory(packageID).standardizedFileURL.path + "/"),
                   files[index].exists else { continue }
             let originalURL = files[index].url
             guard let storedURL = storeCopy(of: originalURL, id: files[index].id, packageID: packageID) else { continue }
+            if isManaged(originalURL) { migratedManagedFiles.append(originalURL) }
             files[index].sourcePath = files[index].sourcePath ?? originalURL.path
             files[index].path = storedURL.path
             migrated = true
+        }
+        let retainedPaths = Set(files.map { $0.url.standardizedFileURL.path })
+        for url in migratedManagedFiles where !retainedPaths.contains(url.standardizedFileURL.path) {
+            try? FileManager.default.removeItem(at: url)
+            removeEmptyManagedParents(of: url.deletingLastPathComponent())
         }
         if migrated { save() }
     }
 
     private func isManaged(_ url: URL) -> Bool {
         url.standardizedFileURL.path.hasPrefix(filesDirectory.standardizedFileURL.path + "/")
+    }
+
+    private func packageComponent(_ name: String) -> String {
+        let component = name.replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ":", with: "-")
+        return component == "." || component == ".." ? "_\(component)" : component
+    }
+
+    private func removeEmptyManagedParents(of directory: URL) {
+        let managedRoot = filesDirectory.standardizedFileURL
+        var current = directory.standardizedFileURL
+        while current.path != managedRoot.path && current.path.hasPrefix(managedRoot.path + "/") {
+            guard let contents = try? FileManager.default.contentsOfDirectory(atPath: current.path),
+                  contents.isEmpty else { return }
+            try? FileManager.default.removeItem(at: current)
+            current.deleteLastPathComponent()
+        }
     }
 
     private func storeCopy(of source: URL, id: UUID, packageID: UUID) -> URL? {
@@ -261,6 +318,25 @@ final class FileCatalog: ObservableObject {
         guard let data = try? Data(contentsOf: packagesURL),
               let decoded = try? JSONDecoder().decode([TrackedPackage].self, from: data) else { return }
         packages = decoded
+        var usedNames: [String: Set<String>] = [:]
+        var changed = false
+        for index in packages.indices {
+            let parentKey = packages[index].parentID?.uuidString ?? "root"
+            let rawBase = packageComponent(packages[index].name.trimmingCharacters(in: .whitespacesAndNewlines))
+            let base = rawBase.isEmpty ? "Folder" : rawBase
+            var candidate = base
+            var suffix = 2
+            while usedNames[parentKey, default: []].contains(candidate.folding(options: [.caseInsensitive], locale: .current)) {
+                candidate = "\(base) (\(suffix))"
+                suffix += 1
+            }
+            usedNames[parentKey, default: []].insert(candidate.folding(options: [.caseInsensitive], locale: .current))
+            if packages[index].name != candidate {
+                packages[index].name = candidate
+                changed = true
+            }
+        }
+        if changed { savePackages() }
     }
 
     private func save() {
@@ -301,6 +377,7 @@ struct ContentView: View {
     @State private var isRunning = false
     @State private var isPackaging = false
     @State private var packagePendingDeletion: TrackedPackage?
+    @AppStorage("automaticScriptsEnabled") private var automaticScriptsEnabled = false
 
     private var visibleFiles: [TrackedFile] {
         let filtered = catalog.files.filter { file in
@@ -392,11 +469,19 @@ struct ContentView: View {
             Text("‘\(packagePendingDeletion?.name ?? "")’ và các bản sao file bên trong sẽ bị xóa khỏi TrialShelf. File nguồn trên máy không bị xóa.")
         }
         .task {
-            registerForLogin()
-            await runExpiredFiles()
+            setLoginItemEnabled(automaticScriptsEnabled)
+            if automaticScriptsEnabled {
+                await runExpiredFiles()
+            }
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 60_000_000_000)
-                await runExpiredFiles()
+                if automaticScriptsEnabled { await runExpiredFiles() }
+            }
+        }
+        .onChange(of: automaticScriptsEnabled) { enabled in
+            setLoginItemEnabled(enabled)
+            if enabled {
+                Task { await runExpiredFiles() }
             }
         }
     }
@@ -417,6 +502,14 @@ struct ContentView: View {
                 Text("\(catalog.packages.filter { $0.parentID == nil }.count) mục lớn · \(catalog.packages.count) folder")
                     .font(.callout.monospacedDigit()).foregroundStyle(.secondary)
                 Spacer()
+                Menu {
+                    Toggle("Tự chạy script đến hạn", isOn: $automaticScriptsEnabled)
+                    Text("Chỉ bật nếu bạn tin cậy các file .sh đã thêm.")
+                        .font(.caption)
+                } label: {
+                    Image(systemName: automaticScriptsEnabled ? "bolt.fill" : "bolt")
+                }
+                .help("Cài đặt chạy script tự động")
                 Button { createPackage(parentID: nil) } label: { Label("Tạo mục lớn", systemImage: "folder.badge.plus") }
                 Button { runSelectedFile() } label: {
                     Label(isRunning ? "Đang chạy…" : "Run", systemImage: "play.fill")
@@ -696,8 +789,12 @@ struct ContentView: View {
         alert.accessoryView = input
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         let name = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty else {
-            toast = "Tên folder không được để trống."
+        guard !name.isEmpty, name != ".", name != ".." else {
+            toast = "Tên folder không hợp lệ. Hãy nhập tên khác."
+            return
+        }
+        guard !catalog.hasPackage(named: name, parentID: parentID) else {
+            toast = "Folder cùng cấp đã có tên này. Hãy chọn tên khác."
             return
         }
         _ = catalog.createPackage(name: name, parentID: parentID)
@@ -763,12 +860,18 @@ struct ContentView: View {
         }
     }
 
-    private func registerForLogin() {
-        guard SMAppService.mainApp.status != .enabled else { return }
+    private func setLoginItemEnabled(_ enabled: Bool) {
         do {
-            try SMAppService.mainApp.register()
+            if enabled {
+                if SMAppService.mainApp.status != .enabled {
+                    try SMAppService.mainApp.register()
+                }
+            } else if SMAppService.mainApp.status == .enabled {
+                try SMAppService.mainApp.unregister()
+            }
         } catch {
-            toast = "Không bật được tự khởi động cùng macOS: \(error.localizedDescription)"
+            automaticScriptsEnabled = false
+            toast = "Không cập nhật được tùy chọn tự chạy: \(error.localizedDescription)"
         }
     }
 
@@ -795,6 +898,9 @@ struct ContentView: View {
 }
 
 private enum ScriptRunner {
+    private static let timeout: TimeInterval = 120
+    private static let maximumCapturedOutput = 64 * 1024
+
     struct Result {
         var succeeded = false
         var status = -1
@@ -839,19 +945,50 @@ private enum ScriptRunner {
         process.currentDirectoryURL = url.deletingLastPathComponent()
         process.environment = ProcessInfo.processInfo.environment.merging(["PATH": path]) { _, new in new }
         let outputPipe = Pipe()
+        let outputQueue = DispatchQueue(label: "TrialShelf.script-output")
+        var capturedOutput = Data()
+        var outputWasTruncated = false
+        outputPipe.fileHandleForReading.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            guard !chunk.isEmpty else {
+                handle.readabilityHandler = nil
+                return
+            }
+            outputQueue.sync {
+                let remaining = max(0, maximumCapturedOutput - capturedOutput.count)
+                if remaining > 0 { capturedOutput.append(chunk.prefix(remaining)) }
+                if chunk.count > remaining { outputWasTruncated = true }
+            }
+        }
+        process.standardInput = FileHandle.nullDevice
         process.standardOutput = outputPipe
         process.standardError = outputPipe
         do {
             try process.run()
-            let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
-            process.waitUntilExit()
+            let deadline = Date().addingTimeInterval(timeout)
+            while process.isRunning && Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+            let timedOut = process.isRunning
+            if timedOut {
+                process.terminate()
+                process.waitUntilExit()
+            }
+            outputPipe.fileHandleForReading.readabilityHandler = nil
+            try? outputPipe.fileHandleForReading.close()
+            let (outputData, wasTruncated) = outputQueue.sync { (capturedOutput, outputWasTruncated) }
+            var output = String(decoding: outputData, as: UTF8.self)
+            if wasTruncated { output += "\n[Output truncated at 64 KiB.]" }
+            if timedOut { output += "\n[Stopped after 120 seconds.]" }
             return Result(
-                succeeded: process.terminationStatus == 0,
+                succeeded: !timedOut && process.terminationStatus == 0,
                 status: Int(process.terminationStatus),
-                output: String(decoding: outputData, as: UTF8.self),
-                error: ""
+                output: output,
+                error: timedOut ? "Stopped after 120 seconds." : ""
             )
         } catch {
+            outputPipe.fileHandleForReading.readabilityHandler = nil
+            try? outputPipe.fileHandleForReading.close()
             return Result(error: error.localizedDescription)
         }
     }
